@@ -903,7 +903,7 @@ def evaluation_mask_transformer_test(val_loader, vq_model, trans, repeat_id, eva
 @torch.no_grad()
 def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, trans, repeat_id, eval_wrapper,
                                 time_steps, cond_scale, temperature, topkr, gsample=True, force_mask=False,
-                                              cal_mm=True, res_cond_scale=5,use_moclip=False):
+                                              cal_mm=True, res_cond_scale=5,use_moclip=True):
     trans.eval()
     vq_model.eval()
     res_model.eval()
