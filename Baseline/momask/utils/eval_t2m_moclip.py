@@ -952,9 +952,8 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, t
 
                 if use_moclip:
                     et_pred, em_pred = eval_wrapper.get_co_embeddings(
-                        clip_text,
-                        pred_motions.clone(),
-                        m_length)
+                    clip_text,
+                    pred_motions.clone())
                 else:
                     et_pred, em_pred = eval_wrapper.get_co_embeddings(
                         word_embeddings,
@@ -984,8 +983,7 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, t
             if use_moclip:
                 et_pred, em_pred = eval_wrapper.get_co_embeddings(
                     clip_text,
-                    pred_motions.clone(),
-                    m_length)
+                    pred_motions.clone())
             else:
                 et_pred, em_pred = eval_wrapper.get_co_embeddings(
                     word_embeddings,
@@ -999,9 +997,8 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, t
 
         if use_moclip:
             et, em = eval_wrapper.get_co_embeddings(
-                clip_text,
-                pose,
-                m_length)
+                    clip_text,
+                    pose)
         else:
             et, em = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pose, m_length)
         motion_annotation_list.append(em)
