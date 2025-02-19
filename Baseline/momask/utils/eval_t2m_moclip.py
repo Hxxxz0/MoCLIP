@@ -1042,16 +1042,22 @@ def evaluation_mask_transformer_test_plus_res(val_loader, vq_model, res_model, t
             motion_annotation_np,
             motion_pred_np, sigma=10,
             scale=1000)
+        mmd_r = eval_wrapper.compute_mmd(
+            motion_annotation_np,
+            motion_annotation_np, sigma=10,
+            scale=1000)
 
     else:
-        mmd = None
-
+        mmd = 0
+        mmd_r = 0
     msg = f"--> \t Eva. Repeat {repeat_id} :, FID. {fid:.4f}, " \
           f"Diversity Real. {diversity_real:.4f}, Diversity. {diversity:.4f}, " \
           f"R_precision_real. {R_precision_real}, R_precision. {R_precision}, " \
           f"matching_score_real. {matching_score_real:.4f}, matching_score_pred. {matching_score_pred:.4f}," \
           f"multimodality. {multimodality:.4f}" \
+          f"mmd_R. {mmd_r:.4f}"\
           f"mmd. {mmd:.4f}"
+
 
     print(msg)
     return fid, diversity, R_precision, matching_score_pred, multimodality, mmd
