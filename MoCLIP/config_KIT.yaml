@@ -1,5 +1,5 @@
 batch_size: 32
-lr: 0.0001
+lr: 0.00008
 weight_decay: 0.0001
 num_epochs: 300
 embed_dim: 768
@@ -10,5 +10,8 @@ dataset_name: "kit"
 input_dim: 251
 max_seq_length: 196
 feat_bias: 5
-pretrain_epochs: 5
-lr_finetune: 0.00001
+pretrain_epochs: 6
+lr_finetune: 0.000008
+meta_dir: "/home/user/dxc/motion/StableMoFusion/t2m_condunet1d_batch64/meta"
+eval_meta_dir: "/home/user/dxc/motion/StableMoFusion/data"
+glove_dir: "/home/user/dxc/motion/StableMoFusion/data/glove"

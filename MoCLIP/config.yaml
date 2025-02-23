@@ -12,3 +12,6 @@ max_seq_length: 196
 feat_bias: 5
 pretrain_epochs: 5
 lr_finetune: 0.00001
+meta_dir: "/home/user/dxc/motion/StableMoFusion/t2m_condunet1d_batch64/meta"
+eval_meta_dir: "/home/user/dxc/motion/StableMoFusion/data"
+glove_dir: "/home/user/dxc/motion/StableMoFusion/data/glove"
