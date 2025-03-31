@@ -14,6 +14,7 @@ from transformers import CLIPModel, CLIPTokenizer
 from collections import OrderedDict
 from datetime import datetime
 from utils.metrics import *
+import ot  # 添加最优传输库导入
 
 # ---------------------------
 # 全局缓存：只在第一次时加载模型，后续重复使用
@@ -196,7 +197,7 @@ def _init_clip_motion_model(model_path):
 # ---------------------------
 # 定义获取文本与动作编码的函数（保持原接口）
 # ---------------------------
-def get_co_embeddings_2(captions, motions, model_path="./moCLIP/clip_motion_align_epoch_16.pt"):
+def get_co_embeddings_2(captions, motions, model_path="/home/user/dxc/motion/CLIP/MoCLIP/clip_motion_align_epoch_21.pt"):
     """
     参数：
         captions: List[str]，文本描述列表
@@ -267,7 +268,90 @@ def get_co_embeddings_2(captions, motions, model_path="./moCLIP/clip_motion_alig
 
 
 # ---------------------------
-# 评价指标相关函数（原封不动）
+# 新增：计算传输分数（Transport Score）
+# ---------------------------
+def calculate_transport_score(motion_embs, text_embs, reg=0.1):
+    """
+    使用最优传输计算文本特征和运动特征之间的传输分数
+    
+    参数:
+    - motion_embs: 归一化的运动特征 [batch_size, embed_dim]
+    - text_embs: 归一化的文本特征 [batch_size, embed_dim]
+    - reg: Sinkhorn算法的正则化参数
+    
+    返回:
+    - transport_score: 传输分数（越低表示匹配越好）
+    """
+    # 确保特征已归一化
+    motion_embs = F.normalize(motion_embs, dim=1)
+    text_embs = F.normalize(text_embs, dim=1)
+    
+    # 计算余弦相似度和成本矩阵
+    cos_sim = torch.mm(motion_embs, text_embs.t()).cpu().numpy()
+    cost_matrix = 1 - cos_sim  # 转换为成本（距离）矩阵
+    
+    # 设置均匀分布
+    n_motions, n_texts = motion_embs.shape[0], text_embs.shape[0]
+    a = np.ones(n_motions) / n_motions  # 源分布
+    b = np.ones(n_texts) / n_texts      # 目标分布
+    
+    # 使用Sinkhorn算法求解最优传输计划
+    transport_plan = ot.sinkhorn(a, b, cost_matrix, reg)
+    
+    # 计算最终传输得分
+    transport_score = np.sum(transport_plan * cost_matrix)
+    
+    return transport_score
+
+
+# ---------------------------
+# 评估函数调用最优传输评价指标
+# ---------------------------
+def evaluate_transport(motion_embs, text_embs, model_name, file):
+    """
+    计算并打印模型的最优传输得分
+    
+    参数:
+    - motion_embs: 运动特征
+    - text_embs: 文本特征
+    - model_name: 模型名称
+    - file: 日志文件
+    
+    返回:
+    - transport_score: 传输分数
+    """
+    transport_score = calculate_transport_score(motion_embs, text_embs, reg=0.02)
+    print(f'---> [{model_name}] Transport Score: {transport_score:.4f}')
+    print(f'---> [{model_name}] Transport Score: {transport_score:.4f}', file=file, flush=True)
+    return transport_score
+
+
+# ---------------------------
+# 新增：计算 CLIP Score
+# ---------------------------
+def compute_clip_score(text_embs, motion_embs):
+    """
+    计算文本特征和运动特征之间的CLIP分数
+    
+    参数:
+    - text_embs: 文本特征 [batch_size, embed_dim]
+    - motion_embs: 运动特征 [batch_size, embed_dim]
+    
+    返回:
+    - clip_score: CLIP分数
+    """
+    # 确保特征已归一化
+    text_embs = F.normalize(text_embs, dim=1)
+    motion_embs = F.normalize(motion_embs, dim=1)
+    
+    # 计算余弦相似度
+    clip_score = torch.diag(torch.mm(text_embs, motion_embs.t()))
+    
+    return clip_score
+
+
+# ---------------------------
+# 评价指标相关函数（修改evaluate_matching_score）
 # ---------------------------
 def get_metric_statistics(values, replication_times):
     mean = np.mean(values, axis=0)
@@ -277,17 +361,23 @@ def get_metric_statistics(values, replication_times):
 
 
 def evaluate_matching_score(eval_wrapper, motion_loaders, file):
-    
     match_score_dict = OrderedDict({})
     R_precision_dict = OrderedDict({})
     activation_dict = OrderedDict({})
-
+    clip_score_dict = OrderedDict({})  # 用于存储每个模型的 CLIP score
+    transport_score_dict = OrderedDict({})  # 用于存储每个模型的传输分数
     print('========== Evaluating Matching Score ==========')
+    
     for motion_loader_name, motion_loader in motion_loaders.items():
         all_motion_embeddings = []
+        all_text_embeddings = []  # 用于存储所有的文本嵌入
+        score_list = []
         all_size = 0
         matching_score_sum = 0
         top_k_count = 0
+        
+        clip_scores = []  # 用来存储每个 batch 的 CLIP score
+        
         with torch.no_grad():
             for idx, batch in enumerate(motion_loader):
                 try:
@@ -295,11 +385,17 @@ def evaluate_matching_score(eval_wrapper, motion_loaders, file):
                 except:
                     captions, motions, m_lens = batch
 
-                # 调用 get_co_embeddings_2 使用 clip 模型进行编码
-                text_embeddings, motion_embeddings = get_co_embeddings_2(
-                    captions,
-                    motions,
-                )
+                # 获取文本和动作的嵌入
+                text_embeddings, motion_embeddings = get_co_embeddings_2(captions, motions)
+                
+                # 计算 CLIP Score
+                clip_score = compute_clip_score(text_embeddings, motion_embeddings)
+                
+                # 对 CLIP score 取绝对值
+                clip_score_abs = torch.abs(clip_score)  # 取绝对值
+                
+                clip_scores.append(clip_score_abs.cpu().numpy())  # 存储该模型的 CLIP score
+
                 dist_mat = euclidean_distance_matrix(text_embeddings.cpu().numpy(),
                                                      motion_embeddings.cpu().numpy())
                 matching_score_sum += dist_mat.trace()
@@ -309,14 +405,32 @@ def evaluate_matching_score(eval_wrapper, motion_loaders, file):
                 top_k_count += top_k_mat.sum(axis=0)
 
                 all_size += text_embeddings.shape[0]
-                all_motion_embeddings.append(motion_embeddings.cpu().numpy())
 
-        all_motion_embeddings = np.concatenate(all_motion_embeddings, axis=0)
-        matching_score = matching_score_sum / all_size
-        R_precision = top_k_count / all_size
-        match_score_dict[motion_loader_name] = matching_score
-        R_precision_dict[motion_loader_name] = R_precision
-        activation_dict[motion_loader_name] = all_motion_embeddings
+                all_motion_embeddings.append(motion_embeddings.cpu().numpy())
+                all_text_embeddings.append(text_embeddings.cpu().numpy())
+
+            all_motion_embeddings = np.concatenate(all_motion_embeddings, axis=0)
+            all_text_embeddings = np.concatenate(all_text_embeddings, axis=0)
+            
+            # 计算匹配得分
+            matching_score = matching_score_sum / all_size
+            R_precision = top_k_count / all_size
+            match_score_dict[motion_loader_name] = matching_score
+            R_precision_dict[motion_loader_name] = R_precision
+            activation_dict[motion_loader_name] = all_motion_embeddings
+
+            # 计算 CLIP score 的均值
+            clip_scores = np.concatenate(clip_scores, axis=0)
+            clip_score_mean = np.mean(clip_scores)
+            clip_score_dict[motion_loader_name] = clip_score_mean  # 存储 CLIP score 的均值
+            print(f'---> [{motion_loader_name}] CLIP Score Mean: {clip_score_mean:.4f}')
+            print(f'---> [{motion_loader_name}] CLIP Score Mean: {clip_score_mean:.4f}', file=file, flush=True)
+            
+            # 计算最优传输分数
+            motion_embs_tensor = torch.tensor(all_motion_embeddings)
+            text_embs_tensor = torch.tensor(all_text_embeddings)
+            transport_score = evaluate_transport(motion_embs_tensor, text_embs_tensor, motion_loader_name, file)
+            transport_score_dict[motion_loader_name] = transport_score
 
         print(f'---> [{motion_loader_name}] Matching Score: {matching_score:.4f}')
         print(f'---> [{motion_loader_name}] Matching Score: {matching_score:.4f}', file=file, flush=True)
@@ -327,7 +441,7 @@ def evaluate_matching_score(eval_wrapper, motion_loaders, file):
         print(line)
         print(line, file=file, flush=True)
 
-    return match_score_dict, R_precision_dict, activation_dict
+    return match_score_dict, R_precision_dict, activation_dict, clip_score_dict, transport_score_dict
 
 
 def evaluate_fid(eval_wrapper, groundtruth_loader, activation_dict, file):
@@ -394,25 +508,63 @@ def evaluate_multimodality(eval_wrapper, mm_motion_loaders, file, mm_num_times):
 # ---------------------------
 # 新增：计算 MMD 部分（使用 clip 模型提取 motion embedding）
 # ---------------------------
+# def compute_mmd(x, y, sigma=10, scale=1000):
+#     """
+#     计算 Gaussian RBF 核下的 MMD 值（针对 motion embedding）
+
+#     Args:
+#         x: numpy 数组，形状为 (n, d)
+#         y: numpy 数组，形状为 (m, d)
+#         sigma: Gaussian 核的带宽参数（默认 10）
+#         scale: 缩放因子（默认 1000），使结果更直观
+#     Returns:
+#         MMD 值（float）
+#     """
+#     gamma = 1.0 / (2 * sigma**2)
+#     x_norm = np.sum(x**2, axis=1, keepdims=True)  # (n, 1)
+#     y_norm = np.sum(y**2, axis=1, keepdims=True)  # (m, 1)
+#     K_xx = np.exp(-gamma * (x_norm + x_norm.T - 2 * np.dot(x, x.T)))
+#     K_yy = np.exp(-gamma * (y_norm + y_norm.T - 2 * np.dot(y, y.T)))
+#     K_xy = np.exp(-gamma * (x_norm + y_norm.T - 2 * np.dot(x, y.T)))
+#     mmd_val = scale * (np.mean(K_xx) + np.mean(K_yy) - 2 * np.mean(K_xy))
+#     return mmd_val
+
+
 def compute_mmd(x, y, sigma=10, scale=1000):
     """
-    计算 Gaussian RBF 核下的 MMD 值（针对 motion embedding）
+    计算 Gaussian RBF 核下的无偏 MMD 值（针对 motion embedding）
 
     Args:
-        x: numpy 数组，形状为 (n, d)
-        y: numpy 数组，形状为 (m, d)
+        x: numpy 数组，形状为 (n, d)，表示第一个分布的样本
+        y: numpy 数组，形状为 (m, d)，表示第二个分布的样本
         sigma: Gaussian 核的带宽参数（默认 10）
         scale: 缩放因子（默认 1000），使结果更直观
     Returns:
         MMD 值（float）
     """
+    # 计算 gamma = 1 / (2 * sigma^2)
     gamma = 1.0 / (2 * sigma**2)
-    x_norm = np.sum(x**2, axis=1, keepdims=True)  # (n, 1)
-    y_norm = np.sum(y**2, axis=1, keepdims=True)  # (m, 1)
-    K_xx = np.exp(-gamma * (x_norm + x_norm.T - 2 * np.dot(x, x.T)))
-    K_yy = np.exp(-gamma * (y_norm + y_norm.T - 2 * np.dot(y, y.T)))
-    K_xy = np.exp(-gamma * (x_norm + y_norm.T - 2 * np.dot(x, y.T)))
-    mmd_val = scale * (np.mean(K_xx) + np.mean(K_yy) - 2 * np.mean(K_xy))
+    
+    # 计算每个样本的 squared L2 norm
+    x_norm = np.sum(x**2, axis=1, keepdims=True)  # 形状 (n, 1)
+    y_norm = np.sum(y**2, axis=1, keepdims=True)  # 形状 (m, 1)
+    
+    # 计算核矩阵 K_xx, K_yy, K_xy
+    K_xx = np.exp(-gamma * (x_norm + x_norm.T - 2 * np.dot(x, x.T)))  # 形状 (n, n)
+    K_yy = np.exp(-gamma * (y_norm + y_norm.T - 2 * np.dot(y, y.T)))  # 形状 (m, m)
+    K_xy = np.exp(-gamma * (x_norm + y_norm.T - 2 * np.dot(x, y.T)))  # 形状 (n, m)
+    
+    # 获取样本数量
+    n = x.shape[0]
+    m = y.shape[0]
+    
+    # 计算无偏估计器的均值（排除对角线元素）
+    mean_K_xx_no_diag = (np.sum(K_xx) - np.trace(K_xx)) / (n * (n - 1)) if n > 1 else 0
+    mean_K_yy_no_diag = (np.sum(K_yy) - np.trace(K_yy)) / (m * (m - 1)) if m > 1 else 0
+    mean_K_xy = np.mean(K_xy)
+    
+    # 计算无偏 MMD 值
+    mmd_val = scale * (mean_K_xx_no_diag + mean_K_yy_no_diag - 2 * mean_K_xy)
     return mmd_val
 
 
@@ -474,7 +626,9 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
     with open(log_file, 'a') as f:
         all_metrics = OrderedDict({
             'R_precision': OrderedDict(),
-            'Motion MMD': OrderedDict()
+            'Motion MMD': OrderedDict(),
+            'CLIP Score': OrderedDict(),
+            'Transport Score': OrderedDict()
         })
 
         for replication in range(replication_times):
@@ -495,14 +649,26 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
                 print(rep_msg)
                 print(rep_msg, file=f, flush=True)
 
-            # 计算 R_precision
-            _, R_dict, activation_dict = evaluate_matching_score(eval_wrapper, motion_loaders, f)
+            # 计算 R_precision、CLIP Score 和 Transport Score
+            match_dict, R_dict, activation_dict, clip_score_dict, transport_score_dict = evaluate_matching_score(eval_wrapper, motion_loaders, f)
 
             # 收集 R_precision
             for model_name, value in R_dict.items():
                 if model_name not in all_metrics['R_precision']:
                     all_metrics['R_precision'][model_name] = []
                 all_metrics['R_precision'][model_name].append(value)
+                
+            # 收集 CLIP Score
+            for model_name, value in clip_score_dict.items():
+                if model_name not in all_metrics['CLIP Score']:
+                    all_metrics['CLIP Score'][model_name] = []
+                all_metrics['CLIP Score'][model_name].append(value)
+                
+            # 收集 Transport Score
+            for model_name, value in transport_score_dict.items():
+                if model_name not in all_metrics['Transport Score']:
+                    all_metrics['Transport Score'][model_name] = []
+                all_metrics['Transport Score'][model_name].append(value)
 
             # 计算 Motion MMD
             mmd_dict = evaluate_mmd(gt_loader, activation_dict, eval_wrapper, f)
@@ -545,6 +711,30 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
             
             final_metrics[f'Motion_MMD_{model_name}'] = mean
             line = f'---> [{model_name}] Motion MMD Mean: {mean:.4f} CInterval: {conf_interval:.4f}'
+            print(line)
+            print(line, file=f, flush=True)
+            
+        # 输出 CLIP Score
+        for model_name, values in all_metrics['CLIP Score'].items():
+            values = np.array(values)
+            mean = np.mean(values, axis=0)
+            std = np.std(values, axis=0)
+            conf_interval = 1.96 * std / np.sqrt(replication_times)
+            
+            final_metrics[f'CLIP_Score_{model_name}'] = mean
+            line = f'---> [{model_name}] CLIP Score Mean: {mean:.4f} CInterval: {conf_interval:.4f}'
+            print(line)
+            print(line, file=f, flush=True)
+            
+        # 输出 Transport Score
+        for model_name, values in all_metrics['Transport Score'].items():
+            values = np.array(values)
+            mean = np.mean(values, axis=0)
+            std = np.std(values, axis=0)
+            conf_interval = 1.96 * std / np.sqrt(replication_times)
+            
+            final_metrics[f'Transport_Score_{model_name}'] = mean
+            line = f'---> [{model_name}] Transport Score Mean: {mean:.4f} CInterval: {conf_interval:.4f}'
             print(line)
             print(line, file=f, flush=True)
         
