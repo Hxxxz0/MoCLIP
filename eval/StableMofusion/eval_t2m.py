@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from transformers import CLIPModel, CLIPTokenizer
 from collections import OrderedDict
 from datetime import datetime
-from utils.metrics import *
+from utils.metrics import *  # 包含 euclidean_distance_matrix, calculate_top_k, calculate_activation_statistics, calculate_frechet_distance, calculate_diversity, calculate_multimodality
 import ot  # 添加最优传输库导入
 
 # ---------------------------
@@ -351,7 +351,7 @@ def compute_clip_score(text_embs, motion_embs):
 
 
 # ---------------------------
-# 评价指标相关函数（修改evaluate_matching_score）
+# 评价指标相关函数（修改evaluate_matching_score，增加 OT TopK 检索指标）
 # ---------------------------
 def get_metric_statistics(values, replication_times):
     mean = np.mean(values, axis=0)
@@ -366,6 +366,7 @@ def evaluate_matching_score(eval_wrapper, motion_loaders, file):
     activation_dict = OrderedDict({})
     clip_score_dict = OrderedDict({})  # 用于存储每个模型的 CLIP score
     transport_score_dict = OrderedDict({})  # 用于存储每个模型的传输分数
+    ot_topk_dict = OrderedDict({})  # 新增：存储基于 OT 传输矩阵的 top-k 检索指标
     print('========== Evaluating Matching Score ==========')
     
     for motion_loader_name, motion_loader in motion_loaders.items():
@@ -377,6 +378,12 @@ def evaluate_matching_score(eval_wrapper, motion_loaders, file):
         top_k_count = 0
         
         clip_scores = []  # 用来存储每个 batch 的 CLIP score
+        
+        # OT TopK 累加器
+        total_samples_ot = 0
+        ot_topk_r1_sum = 0
+        ot_topk_r2_sum = 0
+        ot_topk_r3_sum = 0
         
         with torch.no_grad():
             for idx, batch in enumerate(motion_loader):
@@ -390,12 +397,10 @@ def evaluate_matching_score(eval_wrapper, motion_loaders, file):
                 
                 # 计算 CLIP Score
                 clip_score = compute_clip_score(text_embeddings, motion_embeddings)
-                
-                # 对 CLIP score 取绝对值
                 clip_score_abs = torch.abs(clip_score)  # 取绝对值
-                
-                clip_scores.append(clip_score_abs.cpu().numpy())  # 存储该模型的 CLIP score
+                clip_scores.append(clip_score_abs.cpu().numpy())
 
+                # 计算欧氏距离矩阵并统计匹配得分
                 dist_mat = euclidean_distance_matrix(text_embeddings.cpu().numpy(),
                                                      motion_embeddings.cpu().numpy())
                 matching_score_sum += dist_mat.trace()
@@ -408,40 +413,64 @@ def evaluate_matching_score(eval_wrapper, motion_loaders, file):
 
                 all_motion_embeddings.append(motion_embeddings.cpu().numpy())
                 all_text_embeddings.append(text_embeddings.cpu().numpy())
+                
+                # 计算 OT TopK 检索指标
+                reg_ot = 0.02
+                motion_emb_norm = F.normalize(motion_embeddings, dim=1)
+                text_emb_norm = F.normalize(text_embeddings, dim=1)
+                cos_sim_ot = torch.mm(motion_emb_norm, text_emb_norm.t()).cpu().numpy()
+                cost_matrix_ot = 1 - cos_sim_ot
+                n_samples = motion_embeddings.shape[0]
+                a_ot = np.ones(n_samples) / n_samples
+                b_ot = np.ones(n_samples) / n_samples
+                transport_plan_ot = ot.sinkhorn(a_ot, b_ot, cost_matrix_ot, reg_ot)
+                transport_plan_ot_tensor = torch.tensor(transport_plan_ot)
+                ot_ranks = []
+                for j in range(n_samples):
+                    row = transport_plan_ot_tensor[j]
+                    sorted_idx = torch.argsort(row, descending=True)
+                    rank = (sorted_idx == j).nonzero(as_tuple=True)[0].item()
+                    ot_ranks.append(rank)
+                ot_ranks = torch.tensor(ot_ranks)
+                ot_topk_r1_sum += (ot_ranks < 1).sum().item()
+                ot_topk_r2_sum += (ot_ranks < 2).sum().item()
+                ot_topk_r3_sum += (ot_ranks < 3).sum().item()
+                total_samples_ot += n_samples
 
+            # end for batch
             all_motion_embeddings = np.concatenate(all_motion_embeddings, axis=0)
             all_text_embeddings = np.concatenate(all_text_embeddings, axis=0)
             
-            # 计算匹配得分
             matching_score = matching_score_sum / all_size
             R_precision = top_k_count / all_size
             match_score_dict[motion_loader_name] = matching_score
             R_precision_dict[motion_loader_name] = R_precision
             activation_dict[motion_loader_name] = all_motion_embeddings
 
-            # 计算 CLIP score 的均值
             clip_scores = np.concatenate(clip_scores, axis=0)
             clip_score_mean = np.mean(clip_scores)
-            clip_score_dict[motion_loader_name] = clip_score_mean  # 存储 CLIP score 的均值
+            clip_score_dict[motion_loader_name] = clip_score_mean
             print(f'---> [{motion_loader_name}] CLIP Score Mean: {clip_score_mean:.4f}')
             print(f'---> [{motion_loader_name}] CLIP Score Mean: {clip_score_mean:.4f}', file=file, flush=True)
             
-            # 计算最优传输分数
+            # 计算传输分数
             motion_embs_tensor = torch.tensor(all_motion_embeddings)
             text_embs_tensor = torch.tensor(all_text_embeddings)
             transport_score = evaluate_transport(motion_embs_tensor, text_embs_tensor, motion_loader_name, file)
             transport_score_dict[motion_loader_name] = transport_score
+            
+            # 计算 OT TopK 检索指标
+            if total_samples_ot > 0:
+                ot_r1 = ot_topk_r1_sum / total_samples_ot
+                ot_r2 = ot_topk_r2_sum / total_samples_ot
+                ot_r3 = ot_topk_r3_sum / total_samples_ot
+            else:
+                ot_r1 = ot_r2 = ot_r3 = 0
+            ot_topk_dict[motion_loader_name] = np.array([ot_r1, ot_r2, ot_r3])
+            print(f'---> [{motion_loader_name}] OT TopK Retrieval: R@1={ot_r1:.3f}, R@2={ot_r2:.3f}, R@3={ot_r3:.3f}')
+            print(f'---> [{motion_loader_name}] OT TopK Retrieval: R@1={ot_r1:.3f}, R@2={ot_r2:.3f}, R@3={ot_r3:.3f}', file=file, flush=True)
 
-        print(f'---> [{motion_loader_name}] Matching Score: {matching_score:.4f}')
-        print(f'---> [{motion_loader_name}] Matching Score: {matching_score:.4f}', file=file, flush=True)
-
-        line = f'---> [{motion_loader_name}] R_precision: '
-        for i in range(len(R_precision)):
-            line += '(top %d): %.4f ' % (i+1, R_precision[i])
-        print(line)
-        print(line, file=file, flush=True)
-
-    return match_score_dict, R_precision_dict, activation_dict, clip_score_dict, transport_score_dict
+    return match_score_dict, R_precision_dict, activation_dict, clip_score_dict, transport_score_dict, ot_topk_dict
 
 
 def evaluate_fid(eval_wrapper, groundtruth_loader, activation_dict, file):
@@ -503,31 +532,6 @@ def evaluate_multimodality(eval_wrapper, mm_motion_loaders, file, mm_num_times):
         print(f'---> [{model_name}] Multimodality: {multimodality:.4f}', file=file, flush=True)
         eval_dict[model_name] = multimodality
     return eval_dict
-
-
-# ---------------------------
-# 新增：计算 MMD 部分（使用 clip 模型提取 motion embedding）
-# ---------------------------
-# def compute_mmd(x, y, sigma=10, scale=1000):
-#     """
-#     计算 Gaussian RBF 核下的 MMD 值（针对 motion embedding）
-
-#     Args:
-#         x: numpy 数组，形状为 (n, d)
-#         y: numpy 数组，形状为 (m, d)
-#         sigma: Gaussian 核的带宽参数（默认 10）
-#         scale: 缩放因子（默认 1000），使结果更直观
-#     Returns:
-#         MMD 值（float）
-#     """
-#     gamma = 1.0 / (2 * sigma**2)
-#     x_norm = np.sum(x**2, axis=1, keepdims=True)  # (n, 1)
-#     y_norm = np.sum(y**2, axis=1, keepdims=True)  # (m, 1)
-#     K_xx = np.exp(-gamma * (x_norm + x_norm.T - 2 * np.dot(x, x.T)))
-#     K_yy = np.exp(-gamma * (y_norm + y_norm.T - 2 * np.dot(y, y.T)))
-#     K_xy = np.exp(-gamma * (x_norm + y_norm.T - 2 * np.dot(x, y.T)))
-#     mmd_val = scale * (np.mean(K_xx) + np.mean(K_yy) - 2 * np.mean(K_xy))
-#     return mmd_val
 
 
 def compute_mmd(x, y, sigma=10, scale=1000):
@@ -604,12 +608,12 @@ def evaluate_mmd(groundtruth_loader, activation_dict, eval_wrapper, file):
 
 
 # ---------------------------
-# 下面仅保留示例的 evaluation 函数（评估 R_precision 和 Motion MMD）
+# 下面仅保留示例的 evaluation 函数（评估 R_precision、Motion MMD、CLIP Score、Transport Score 以及 OT TopK）
 # ---------------------------
 def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replication_times,
                diversity_times, mm_num_times, device, run_mm=False):
     """
-    评估函数：示例评估 R_precision 和 Motion MMD 指标
+    评估函数：示例评估 R_precision、Motion MMD、CLIP Score、Transport Score 以及 OT TopK 指标
 
     参数说明：
       - eval_wrapper: 评估时所用的封装器/模型
@@ -628,7 +632,8 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
             'R_precision': OrderedDict(),
             'Motion MMD': OrderedDict(),
             'CLIP Score': OrderedDict(),
-            'Transport Score': OrderedDict()
+            'Transport Score': OrderedDict(),
+            'OT TopK': OrderedDict()
         })
 
         for replication in range(replication_times):
@@ -649,8 +654,8 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
                 print(rep_msg)
                 print(rep_msg, file=f, flush=True)
 
-            # 计算 R_precision、CLIP Score 和 Transport Score
-            match_dict, R_dict, activation_dict, clip_score_dict, transport_score_dict = evaluate_matching_score(eval_wrapper, motion_loaders, f)
+            # 计算 R_precision、CLIP Score、Transport Score 和 OT TopK
+            match_dict, R_dict, activation_dict, clip_score_dict, transport_score_dict, ot_topk_dict = evaluate_matching_score(eval_wrapper, motion_loaders, f)
 
             # 收集 R_precision
             for model_name, value in R_dict.items():
@@ -669,7 +674,13 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
                 if model_name not in all_metrics['Transport Score']:
                     all_metrics['Transport Score'][model_name] = []
                 all_metrics['Transport Score'][model_name].append(value)
-
+            
+            # 收集 OT TopK
+            for model_name, value in ot_topk_dict.items():
+                if model_name not in all_metrics['OT TopK']:
+                    all_metrics['OT TopK'][model_name] = []
+                all_metrics['OT TopK'][model_name].append(value)
+                
             # 计算 Motion MMD
             mmd_dict = evaluate_mmd(gt_loader, activation_dict, eval_wrapper, f)
             for model_name, mmd_value in mmd_dict.items():
@@ -737,6 +748,19 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
             line = f'---> [{model_name}] Transport Score Mean: {mean:.4f} CInterval: {conf_interval:.4f}'
             print(line)
             print(line, file=f, flush=True)
+            
+        # 输出 OT TopK Retrieval
+        for model_name, values in all_metrics['OT TopK'].items():
+            values = np.array(values)  # shape: (replications, 3)
+            mean = np.mean(values, axis=0)
+            std = np.std(values, axis=0)
+            conf_interval = 1.96 * std / np.sqrt(replication_times)
+            final_metrics[f'OT_TopK_{model_name}'] = mean
+            line = '---> [{}] OT TopK Retrieval: '.format(model_name) + '; '.join(
+                    [f'(top {i+1}) Mean: {m:.4f} CInterval: {c:.4f}'
+                     for i, (m, c) in enumerate(zip(mean, conf_interval))]
+                )
+            print(line)
+            print(line, file=f, flush=True)
         
         return final_metrics
-
